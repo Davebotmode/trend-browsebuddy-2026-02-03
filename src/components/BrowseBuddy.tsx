@@ -82,6 +82,24 @@ export default function BrowseBuddy() {
         `/api/extract?url=${encodeURIComponent(url.trim())}&mode=${encodeURIComponent(mode)}`
       );
       const json = (await res.json()) as ExtractResult;
+
+      // If fetch is blocked (403/anti-bot), allow manual paste fallback.
+      if (!json.ok && /403\b/.test(json.error ?? '')) {
+        const pasted = window.prompt(
+          'This site blocked server-side fetching (403).\n\nPaste the article text (or main content) here to analyze instead:'
+        );
+        if (pasted && pasted.trim()) {
+          const alt = await fetch(`/api/analyze?mode=${encodeURIComponent(mode)}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ url: url.trim(), title: url.trim(), textContent: pasted }),
+          });
+          const altJson = (await alt.json()) as ExtractResult;
+          setData(altJson);
+          return;
+        }
+      }
+
       setData(json);
     } catch (e: unknown) {
       const err = e as { message?: string } | null;
