@@ -1,10 +1,25 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+
+type Capabilities = {
+  hasOpenAIKey: boolean;
+};
+
+type LlmPlan = {
+  summary: string;
+  key_points: string[];
+  risks: string[];
+  next_actions: string[];
+  questions_to_answer: string[];
+};
 
 type ExtractResult = {
   ok: boolean;
   error?: string;
+  warning?: string;
+  mode?: 'deterministic' | 'llm';
+  llm?: LlmPlan;
   url?: string;
   title?: string;
   byline?: string;
@@ -28,6 +43,24 @@ export default function BrowseBuddy() {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<ExtractResult | null>(null);
+  const [caps, setCaps] = useState<Capabilities | null>(null);
+  const [llmMode, setLlmMode] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/capabilities');
+        const json = (await res.json()) as Capabilities;
+        if (mounted) setCaps(json);
+      } catch {
+        if (mounted) setCaps({ hasOpenAIKey: false });
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const canSubmit = useMemo(() => {
     if (!url.trim()) return false;
@@ -44,11 +77,15 @@ export default function BrowseBuddy() {
     setLoading(true);
     setData(null);
     try {
-      const res = await fetch(`/api/extract?url=${encodeURIComponent(url.trim())}`);
+      const mode = llmMode ? 'llm' : 'deterministic';
+      const res = await fetch(
+        `/api/extract?url=${encodeURIComponent(url.trim())}&mode=${encodeURIComponent(mode)}`
+      );
       const json = (await res.json()) as ExtractResult;
       setData(json);
-    } catch (e: any) {
-      setData({ ok: false, error: e?.message ?? 'Unknown error' });
+    } catch (e: unknown) {
+      const err = e as { message?: string } | null;
+      setData({ ok: false, error: err?.message ?? 'Unknown error' });
     } finally {
       setLoading(false);
     }
@@ -60,7 +97,7 @@ export default function BrowseBuddy() {
         <div>
           <h1>BrowseBuddy</h1>
           <p className="sub">
-            A "page-aware" browser assistant — without API keys. Paste a URL, and it will extract the
+            A &quot;page-aware&quot; browser assistant — without API keys. Paste a URL, and it will extract the
             main content, surface keywords/entities, and propose a next-action checklist.
           </p>
         </div>
@@ -80,6 +117,22 @@ export default function BrowseBuddy() {
           <button className="button" onClick={run} disabled={!canSubmit || loading}>
             {loading ? 'Analyzing…' : 'Analyze'}
           </button>
+        </div>
+
+        <div className="row" style={{ marginTop: 10, justifyContent: 'flex-start', gap: 10 }}>
+          <label className="fine" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={llmMode}
+              disabled={!caps?.hasOpenAIKey}
+              onChange={(e) => setLlmMode(e.target.checked)}
+            />
+            LLM mode (uses server key)
+          </label>
+          {!caps ? <span className="fine muted">Checking capabilities…</span> : null}
+          {caps && !caps.hasOpenAIKey ? (
+            <span className="fine muted">(OPENAI_API_KEY not set on server)</span>
+          ) : null}
         </div>
         <div className="examples">
           <span className="muted">Try:</span>
@@ -109,6 +162,13 @@ export default function BrowseBuddy() {
           <p className="mono">{data.error ?? 'Unknown error'}</p>
         </section>
       )}
+
+      {data && data.ok && data.warning ? (
+        <section className="card" style={{ borderColor: 'rgba(255, 204, 102, 0.45)' }}>
+          <h2 style={{ marginTop: 0 }}>Note</h2>
+          <p className="mono">{data.warning}</p>
+        </section>
+      ) : null}
 
       {data && data.ok && (
         <section className="grid">
@@ -194,6 +254,60 @@ export default function BrowseBuddy() {
                 you can extend.
               </p>
             </section>
+
+            {llmMode ? (
+              <section className="card">
+                <h3>LLM summary + plan</h3>
+                {data.llm ? (
+                  <div style={{ display: 'grid', gap: 10 }}>
+                    <div>
+                      <div className="kicker">Summary</div>
+                      <p style={{ marginTop: 6 }}>{data.llm.summary}</p>
+                    </div>
+
+                    <div>
+                      <div className="kicker">Key points</div>
+                      <ul className="list">
+                        {data.llm.key_points.map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    {(data.llm.risks ?? []).length ? (
+                      <div>
+                        <div className="kicker">Risks / caveats</div>
+                        <ul className="list">
+                          {data.llm.risks.map((x, i) => (
+                            <li key={i}>{x}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+
+                    <div>
+                      <div className="kicker">Next actions</div>
+                      <ol className="list">
+                        {data.llm.next_actions.map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                      </ol>
+                    </div>
+
+                    <div>
+                      <div className="kicker">Questions to answer</div>
+                      <ul className="list">
+                        {data.llm.questions_to_answer.map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="muted">No LLM output (using deterministic output).</p>
+                )}
+              </section>
+            ) : null}
           </aside>
         </section>
       )}

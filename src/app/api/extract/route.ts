@@ -8,6 +8,16 @@ import { removeStopwords } from 'stopword';
 
 export const runtime = 'nodejs';
 
+type Mode = 'deterministic' | 'llm';
+
+type LlmPlan = {
+  summary: string;
+  key_points: string[];
+  risks: string[];
+  next_actions: string[];
+  questions_to_answer: string[];
+};
+
 function clampString(s: string, max = 120_000) {
   return s.length > max ? s.slice(0, max) : s;
 }
@@ -58,6 +68,122 @@ function computeEntities(text: string) {
     .slice(0, 20);
 }
 
+function hasOpenAIKey() {
+  return Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
+}
+
+function isValidLlmPlan(x: unknown): x is LlmPlan {
+  const isStr = (v: unknown) => typeof v === 'string' && v.trim().length > 0;
+  const isStrArr = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === 'string');
+  return (
+    x &&
+    isStr(x.summary) &&
+    isStrArr(x.key_points) &&
+    isStrArr(x.risks) &&
+    isStrArr(x.next_actions) &&
+    isStrArr(x.questions_to_answer)
+  );
+}
+
+async function runOpenAIPlan(input: {
+  url: string;
+  title?: string | null;
+  siteName?: string | null;
+  byline?: string | null;
+  excerpt?: string | null;
+  textContent: string;
+  topKeywords: { term: string; score: number }[];
+  entities: { type: string; text: string; count: number }[];
+}): Promise<LlmPlan> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY missing');
+
+  const prompt = [
+    'You are BrowseBuddy, a page-aware assistant.',
+    'Given an extracted web page, produce a concise summary and an action plan.',
+    '',
+    'Return ONLY valid JSON matching this TypeScript type:',
+    '{',
+    '  summary: string;',
+    '  key_points: string[];',
+    '  risks: string[];',
+    '  next_actions: string[];',
+    '  questions_to_answer: string[];',
+    '}',
+    '',
+    'Guidelines:',
+    '- Keep summary <= 6 sentences.',
+    '- key_points: 5-10 bullets.',
+    '- risks: 0-6 bullets (include missing info, bias, blockers).',
+    '- next_actions: 5-10 bullets, pragmatic and sequenced.',
+    '- questions_to_answer: 3-8 bullets.',
+  ].join('\n');
+
+  const payload = {
+    model: 'gpt-4.1-mini',
+    input: [
+      {
+        role: 'system',
+        content: [{ type: 'text', text: prompt }],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                url: input.url,
+                title: input.title,
+                siteName: input.siteName,
+                byline: input.byline,
+                excerpt: input.excerpt,
+                topKeywords: input.topKeywords,
+                entities: input.entities,
+                textContent: clampString(input.textContent, 40_000),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      },
+    ],
+    // Prefer JSON output
+    text: { format: { type: 'json_object' } },
+  };
+
+  const res = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`OpenAI error: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 500)}` : ''}`);
+  }
+
+  const json = await res.json();
+  // Responses API: easiest extraction is output_text when format is JSON; still guard.
+  const text = (json?.output_text as string) || '';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Some responses embed JSON elsewhere; attempt to find the first {...} block.
+    const m = text.match(/\{[\s\S]*\}$/);
+    if (!m) throw new Error('Could not parse JSON from OpenAI response');
+    parsed = JSON.parse(m[0]);
+  }
+
+  if (!isValidLlmPlan(parsed)) throw new Error('OpenAI returned invalid JSON contract');
+  return parsed;
+}
+
 function computeChecklist(text: string, title?: string) {
   const hay = `${title ?? ''}\n\n${text}`.toLowerCase();
 
@@ -96,6 +222,7 @@ function computeChecklist(text: string, title?: string) {
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const rawUrl = searchParams.get('url')?.trim();
+  const mode = (searchParams.get('mode') || 'deterministic') as Mode;
 
   if (!rawUrl) {
     return NextResponse.json({ ok: false, error: 'Missing ?url=' }, { status: 400 });
@@ -164,8 +291,8 @@ export async function GET(req: Request) {
     const entities = textContent ? computeEntities(textContent) : [];
     const actionChecklist = computeChecklist(textContent, article.title ?? undefined);
 
-    return NextResponse.json({
-      ok: true,
+    const base = {
+      ok: true as const,
       url: url.toString(),
       title: article.title,
       byline: article.byline,
@@ -177,9 +304,38 @@ export async function GET(req: Request) {
       topKeywords,
       entities,
       actionChecklist,
-    });
-  } catch (e: any) {
-    const msg = e?.name === 'AbortError' ? 'Fetch timed out (12s).' : e?.message ?? 'Unknown error.';
+    };
+
+    if (mode !== 'llm') {
+      return NextResponse.json(base);
+    }
+
+    if (!hasOpenAIKey()) {
+      return NextResponse.json({ ...base, warning: 'LLM mode requested but OPENAI_API_KEY is not set; using deterministic output.' });
+    }
+
+    try {
+      const llm = await runOpenAIPlan({
+        url: url.toString(),
+        title: article.title,
+        siteName: article.siteName,
+        byline: article.byline,
+        excerpt: article.excerpt,
+        textContent,
+        topKeywords,
+        entities,
+      });
+      return NextResponse.json({ ...base, llm, mode: 'llm' as const });
+    } catch (e: unknown) {
+      const err = e as { message?: string } | null;
+      return NextResponse.json({
+        ...base,
+        warning: `LLM mode failed; using deterministic output. ${err?.message ?? ''}`.trim(),
+      });
+    }
+  } catch (e: unknown) {
+    const err = e as { name?: string; message?: string } | null;
+    const msg = err?.name === 'AbortError' ? 'Fetch timed out (12s).' : err?.message ?? 'Unknown error.';
     return NextResponse.json({ ok: false, error: msg }, { status: 500 });
   }
 }
